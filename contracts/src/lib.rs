@@ -345,7 +345,7 @@ mod test {
     use super::*;
     use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
 
-    fn setup_contract_with_admin(env: &Env) -> (Address, Address, HealthChainContractClient) {
+    fn setup_contract_with_admin(env: &Env) -> (Address, Address, HealthChainContractClient<'_>) {
         let admin = Address::generate(env);
         let contract_id = env.register(HealthChainContract, ());
         let client = HealthChainContractClient::new(env, &contract_id);
@@ -479,7 +479,6 @@ mod test {
         env.mock_all_auths();
         client.register_blood_bank(&bank);
 
-        let current_time = env.ledger().timestamp();
         let expiration = 0; // Already expired
 
         client.register_blood(

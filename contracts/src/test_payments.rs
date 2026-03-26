@@ -6,6 +6,19 @@ use crate::payments::{
 };
 
 use soroban_sdk::{testutils::Address as _, vec, Address, Env, Symbol};
+
+fn payment_with_status(env: &Env, status: PaymentStatus) -> Payment {
+    Payment {
+        id: 1,
+        request_id: 10,
+        payer: Address::generate(env),
+        payee: Address::generate(env),
+        amount: 1_000,
+        asset: Address::generate(env),
+        status,
+        escrow_released_at: None,
+    }
+}
 // ======================================================
 // Payment Validation Tests
 // ======================================================
@@ -114,16 +127,7 @@ fn payment_fails_when_asset_equals_payee() {
 fn payment_state_machine_is_correct() {
     let env = Env::default();
 
-    let payment = Payment {
-        id: 1,
-        request_id: 10,
-        payer: Address::generate(&env),
-        payee: Address::generate(&env),
-        amount: 1_000,
-        asset: Address::generate(&env),
-        status: PaymentStatus::Pending,
-        escrow_released_at: None,
-    };
+    let payment = payment_with_status(&env, PaymentStatus::Pending);
 
     assert!(payment.can_transition_to(PaymentStatus::Cancelled));
     assert!(payment.can_transition_to(PaymentStatus::Escrowed));
@@ -153,6 +157,69 @@ fn payment_state_machine_is_correct() {
     };
     assert!(resolved_payment.can_transition_to(PaymentStatus::Completed));
     assert!(resolved_payment.can_transition_to(PaymentStatus::Refunded));
+}
+
+#[test]
+fn payment_status_allowed_transition_matrix_is_complete() {
+    let env = Env::default();
+
+    let allowed = [
+        (PaymentStatus::Pending, PaymentStatus::Escrowed),
+        (PaymentStatus::Pending, PaymentStatus::Cancelled),
+        (PaymentStatus::Escrowed, PaymentStatus::Completed),
+        (PaymentStatus::Escrowed, PaymentStatus::Refunded),
+        (PaymentStatus::Escrowed, PaymentStatus::Disputed),
+        (PaymentStatus::Disputed, PaymentStatus::Resolved),
+        (PaymentStatus::Resolved, PaymentStatus::Completed),
+        (PaymentStatus::Resolved, PaymentStatus::Refunded),
+    ];
+
+    for (from, to) in allowed {
+        let payment = payment_with_status(&env, from);
+        assert!(payment.can_transition_to(to), "allowed transition missing");
+    }
+}
+
+#[test]
+fn payment_status_forbidden_transition_matrix_is_complete() {
+    let env = Env::default();
+    let statuses = [
+        PaymentStatus::Pending,
+        PaymentStatus::Escrowed,
+        PaymentStatus::Disputed,
+        PaymentStatus::Resolved,
+        PaymentStatus::Completed,
+        PaymentStatus::Refunded,
+        PaymentStatus::Cancelled,
+    ];
+
+    let allowed = [
+        (PaymentStatus::Pending, PaymentStatus::Escrowed),
+        (PaymentStatus::Pending, PaymentStatus::Cancelled),
+        (PaymentStatus::Escrowed, PaymentStatus::Completed),
+        (PaymentStatus::Escrowed, PaymentStatus::Refunded),
+        (PaymentStatus::Escrowed, PaymentStatus::Disputed),
+        (PaymentStatus::Disputed, PaymentStatus::Resolved),
+        (PaymentStatus::Resolved, PaymentStatus::Completed),
+        (PaymentStatus::Resolved, PaymentStatus::Refunded),
+    ];
+
+    let mut forbidden_checked = 0u32;
+    for from in statuses {
+        let payment = payment_with_status(&env, from);
+        for to in statuses {
+            if allowed.contains(&(from, to)) {
+                continue;
+            }
+            forbidden_checked += 1;
+            assert!(
+                !payment.can_transition_to(to),
+                "forbidden transition unexpectedly allowed"
+            );
+        }
+    }
+
+    assert_eq!(forbidden_checked, 41);
 }
 
 #[test]

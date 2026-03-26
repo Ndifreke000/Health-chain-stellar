@@ -51,6 +51,8 @@ pub enum Error {
     NominationExpired = 23,
     /// A pending nomination already exists.
     NominationPending = 24,
+    /// Overflow/underflow detected during quantity arithmetic.
+    ArithmeticError = 25,
 }
 
 // Alias for issue/docs terminology.
@@ -1600,7 +1602,9 @@ impl HealthChainContract {
 
         payments.set(payment_id, payment);
         env.storage().persistent().set(&PAYMENTS, &payments);
-        env.storage().instance().set(&NEXT_PAYMENT_ID, &(payment_id + 1));
+        env.storage()
+            .instance()
+            .set(&NEXT_PAYMENT_ID, &(payment_id + 1));
 
         Ok(payment_id)
     }
@@ -1656,7 +1660,9 @@ impl HealthChainContract {
 
         disputes.set(dispute_id, dispute);
         env.storage().persistent().set(&DISPUTES, &disputes);
-        env.storage().instance().set(&NEXT_DISPUTE_ID, &(dispute_id + 1));
+        env.storage()
+            .instance()
+            .set(&NEXT_DISPUTE_ID, &(dispute_id + 1));
 
         // Update Request Status if possible
         let mut requests: Map<u64, BloodRequest> = env
@@ -1717,7 +1723,9 @@ impl HealthChainContract {
             .get(&PAYMENTS)
             .ok_or(Error::PaymentNotFound)?;
 
-        let mut payment = payments.get(dispute.payment_id).ok_or(Error::PaymentNotFound)?;
+        let mut payment = payments
+            .get(dispute.payment_id)
+            .ok_or(Error::PaymentNotFound)?;
 
         dispute.status = resolution;
         dispute.resolved_at = Some(env.ledger().timestamp());
@@ -1725,7 +1733,7 @@ impl HealthChainContract {
         env.storage().persistent().set(&DISPUTES, &disputes);
 
         payment.status = PaymentStatus::Resolved;
-        
+
         // Handle funds based on resolution
         match resolution {
             DisputeStatus::ResolvedInFavorOfPayer => {
@@ -1850,7 +1858,9 @@ impl HealthChainContract {
                 return Err(Error::UnitExpired);
             }
 
-            total_quantity = total_quantity.saturating_add(unit.quantity);
+            total_quantity = total_quantity
+                .checked_add(unit.quantity)
+                .ok_or(Error::ArithmeticError)?;
         }
 
         // Reserve units to the requesting hospital.
@@ -1912,7 +1922,7 @@ impl HealthChainContract {
                 fulfillment_percentage: Self::calculate_fulfillment_percentage(
                     request.quantity_ml,
                     total_quantity,
-                ),
+                )?,
                 status: request.status,
             },
         );
@@ -2041,7 +2051,9 @@ impl HealthChainContract {
             unit.status = BloodStatus::Delivered;
             let current_time = env.ledger().timestamp();
             unit.delivery_timestamp = Some(current_time);
-            delivered_quantity = delivered_quantity.saturating_add(unit.quantity);
+            delivered_quantity = delivered_quantity
+                .checked_add(unit.quantity)
+                .ok_or(Error::ArithmeticError)?;
 
             units.set(unit_id, unit.clone());
 
@@ -2117,13 +2129,19 @@ impl HealthChainContract {
         }
     }
 
-    fn calculate_fulfillment_percentage(requested_quantity: u32, fulfilled_quantity: u32) -> u32 {
+    fn calculate_fulfillment_percentage(
+        requested_quantity: u32,
+        fulfilled_quantity: u32,
+    ) -> Result<u32, Error> {
         if requested_quantity == 0 {
-            return 0;
+            return Ok(0);
         }
 
-        let percentage = fulfilled_quantity.saturating_mul(100) / requested_quantity;
-        percentage.min(100)
+        let percentage = fulfilled_quantity
+            .checked_mul(100)
+            .ok_or(Error::ArithmeticError)?
+            / requested_quantity;
+        Ok(percentage.min(100))
     }
 
     // ── SUPER ADMIN TWO-STEP TRANSFER ────────────────────────────────────────────────────
@@ -2156,7 +2174,10 @@ impl HealthChainContract {
 
         env.storage().instance().set(
             &DataKey::PendingNominee,
-            &NominationEntry { nominee, nominated_at: now },
+            &NominationEntry {
+                nominee,
+                nominated_at: now,
+            },
         );
         Ok(())
     }
@@ -3759,6 +3780,115 @@ mod test {
         client.approve_request(&non_bank, &request_id, &unit_ids);
     }
 
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")] // ArithmeticError
+    fn test_approve_request_fails_on_total_quantity_overflow() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+
+        let current_time = env.ledger().timestamp();
+        let expiration = current_time + (7 * 86400);
+
+        let unit_id_1 = client.add_blood_unit(
+            &BloodType::APositive,
+            &500,
+            &expiration,
+            &symbol_short!("donor1"),
+            &symbol_short!("bank"),
+        );
+        let unit_id_2 = client.add_blood_unit(
+            &BloodType::APositive,
+            &500,
+            &expiration,
+            &symbol_short!("donor2"),
+            &symbol_short!("bank"),
+        );
+
+        env.as_contract(&contract_id, || {
+            let mut units: Map<u64, BloodUnit> = env
+                .storage()
+                .persistent()
+                .get(&BLOOD_UNITS)
+                .unwrap_or(Map::new(&env));
+
+            let mut unit_1 = units.get(unit_id_1).unwrap();
+            unit_1.quantity = u32::MAX;
+            units.set(unit_id_1, unit_1);
+
+            let mut unit_2 = units.get(unit_id_2).unwrap();
+            unit_2.quantity = 1;
+            units.set(unit_id_2, unit_2);
+
+            env.storage().persistent().set(&BLOOD_UNITS, &units);
+        });
+
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::APositive,
+            &500,
+            &UrgencyLevel::Urgent,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward O1"),
+        );
+
+        let unit_ids = vec![&env, unit_id_1, unit_id_2];
+        env.mock_all_auths();
+        client.approve_request(&bank, &request_id, &unit_ids);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")] // ArithmeticError
+    fn test_approve_request_fails_on_fulfillment_percentage_overflow() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+
+        let current_time = env.ledger().timestamp();
+        let expiration = current_time + (7 * 86400);
+
+        let unit_id = client.add_blood_unit(
+            &BloodType::OPositive,
+            &500,
+            &expiration,
+            &symbol_short!("donor1"),
+            &symbol_short!("bank"),
+        );
+
+        env.as_contract(&contract_id, || {
+            let mut units: Map<u64, BloodUnit> = env
+                .storage()
+                .persistent()
+                .get(&BLOOD_UNITS)
+                .unwrap_or(Map::new(&env));
+
+            let mut unit = units.get(unit_id).unwrap();
+            unit.quantity = u32::MAX;
+            units.set(unit_id, unit);
+
+            env.storage().persistent().set(&BLOOD_UNITS, &units);
+        });
+
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::OPositive,
+            &50,
+            &UrgencyLevel::Routine,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward O2"),
+        );
+
+        let unit_ids = vec![&env, unit_id];
+        env.mock_all_auths();
+        client.approve_request(&bank, &request_id, &unit_ids);
+    }
+
     // Request Status Management Tests
 
     #[test]
@@ -4064,6 +4194,74 @@ mod test {
         let unit_ids = vec![&env, 1u64];
         env.mock_all_auths();
         client.fulfill_request(&hospital, &request_id, &unit_ids);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")] // ArithmeticError
+    fn test_fulfill_request_fails_on_delivered_quantity_overflow() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+
+        let current_time = env.ledger().timestamp();
+        let expiration = current_time + (7 * 86400);
+
+        let unit_id_1 = client.register_blood(
+            &bank,
+            &BloodType::BPositive,
+            &250,
+            &expiration,
+            &Some(symbol_short!("d1")),
+        );
+        let unit_id_2 = client.register_blood(
+            &bank,
+            &BloodType::BPositive,
+            &250,
+            &expiration,
+            &Some(symbol_short!("d2")),
+        );
+
+        env.mock_all_auths();
+        client.allocate_blood(&bank, &unit_id_1, &hospital);
+        env.mock_all_auths();
+        client.allocate_blood(&bank, &unit_id_2, &hospital);
+
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::BPositive,
+            &500,
+            &UrgencyLevel::Urgent,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward F1"),
+        );
+
+        let unit_ids = vec![&env, unit_id_1, unit_id_2];
+        env.mock_all_auths();
+        client.approve_request(&bank, &request_id, &unit_ids);
+
+        env.as_contract(&contract_id, || {
+            let mut units: Map<u64, BloodUnit> = env
+                .storage()
+                .persistent()
+                .get(&BLOOD_UNITS)
+                .unwrap_or(Map::new(&env));
+
+            let mut unit_1 = units.get(unit_id_1).unwrap();
+            unit_1.quantity = u32::MAX;
+            units.set(unit_id_1, unit_1);
+
+            let mut unit_2 = units.get(unit_id_2).unwrap();
+            unit_2.quantity = 1;
+            units.set(unit_id_2, unit_2);
+
+            env.storage().persistent().set(&BLOOD_UNITS, &units);
+        });
+
+        env.mock_all_auths();
+        client.fulfill_request(&bank, &request_id, &unit_ids);
     }
 
     #[test]
